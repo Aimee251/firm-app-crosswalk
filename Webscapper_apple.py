@@ -1,20 +1,17 @@
 """
-Step 3 (revised) — Web search is the entry point.
+Step 3 — Apple lookup via the iTunes Search API (no DuckDuckGo, no throttling pain).
 
 Per company (only those AI-flagged YES / UNCLEAR in step 2):
-  1. Web-search the company to find ONE App Store link. Web search handles
-     "company name != app name" far better than the iTunes name search.
-  2. From that link, pull the App Store app id (or developer id directly).
-  3. Look the app up in the iTunes API to get its DEVELOPER (artist) id.
-  4. Use the developer id to pull EVERY app under that developer.
-  5. Save all rows to Excel, with a confidence flag.
+  1. iTunes SEARCH by company name -> candidate apps (each already carries artistId).
+  2. Pick the best candidate: domain match on sellerUrl > name similarity > top result.
+  3. Use that candidate's developer (artist) id to pull EVERY app under the developer.
+  4. Save all rows with a confidence flag. Resume-safe.
 
-Install first:
-    pip install ddgs pandas requests openpyxl
+Install:
+    pip install pandas requests openpyxl
 
-Note: DuckDuckGo throttles aggressively. For a 1000-company run expect it to
-be slow and to occasionally return nothing (rate-limited). For production
-scale, swap find_apple_listing() for a paid SERP API (Serper / SerpAPI).
+Note: Apple throttles the iTunes API to roughly ~20 calls/min, so this step is
+inherently slower than the classifier. Keep MAX_WORKERS small; backoff handles 403s.
 """
 
 import os
@@ -24,16 +21,16 @@ import pandas as pd
 import requests
 from urllib.parse import urlparse
 from difflib import SequenceMatcher
-from ddgs import DDGS
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 INPUT_FILE = "/Users/tianyuzhou/Documents/Finance_RA/pitchbook_app_classified.xlsx"
 OUTPUT_FILE = "/Users/tianyuzhou/Documents/Finance_RA/apple_developer_apps.xlsx"
 
-PROCESS_STATUSES = {"YES", "UNCLEAR"}  # skip companies the AI said clearly have no app
-CHECKPOINT_EVERY = 25                  # save progress every N companies
-WEB_SLEEP = 3.0                        # between companies (DuckDuckGo throttles)
-API_SLEEP = 1.0                        # between iTunes API calls
-MAX_WEB_RESULTS = 8
+PROCESS_STATUSES = {"YES", "UNCLEAR"}
+MAX_WORKERS = 4            # keep small — Apple throttles the iTunes API
+CHECKPOINT_EVERY = 25
+SEARCH_LIMIT = 10
+MAX_RETRIES = 4
 
 NAME_NOISE = {
     "inc", "incorporated", "llc", "ltd", "limited", "corp", "corporation",
@@ -42,7 +39,7 @@ NAME_NOISE = {
 }
 
 
-#small helpers (used for the confidence flag)
+# ---------- name / domain helpers ----------
 
 def core_name(name):
     if not isinstance(name, str):
@@ -52,7 +49,6 @@ def core_name(name):
 
 
 def registered_domain(url):
-    """Return registrable domain (e.g. 'spinn.com') from a URL/website."""
     if not isinstance(url, str) or not url.strip():
         return ""
     u = url.strip()
@@ -78,87 +74,63 @@ def name_similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
-# web search to find the App Store link
+# ---------- iTunes API (with backoff on 403/429) ----------
 
-def extract_apple_ids(url):
-    """Return ('developer'|'app', id) from an apps.apple.com URL, else (None, None)."""
-    if "/developer/" in url:
-        m = re.search(r"id(\d+)", url)
-        return ("developer", m.group(1)) if m else (None, None)
-    m = re.search(r"/id(\d+)", url)  # app page: /app/<slug>/id123456789
-    return ("app", m.group(1)) if m else (None, None)
-
-
-def web_search(ddgs, query, retries=2):
-    for attempt in range(retries + 1):
-        try:
-            return list(ddgs.text(query, max_results=MAX_WEB_RESULTS, region="us-en"))
-        except Exception as e:
-            if attempt < retries:
-                time.sleep(5)
-            else:
-                print(f"  web search failed ({query!r}): {e}")
+def itunes_get(url, params):
+    for attempt in range(MAX_RETRIES):
+        resp = requests.get(url, params=params, timeout=15)
+        if resp.status_code in (403, 429):
+            time.sleep(2 ** attempt * 3)
+            continue
+        resp.raise_for_status()
+        return resp.json().get("results", [])
     return []
 
 
-def find_apple_listing(company_name, company_domain, ddgs):
-    """Return (apple_url, kind, apple_id) for the first App Store link found."""
-    queries = [f"{company_name} app site:apps.apple.com",
-               f"{company_name} app store ios"]
-    if company_domain:
-        queries.insert(0, f"{company_name} {company_domain} app store")
-
-    for q in queries:
-        for r in web_search(ddgs, q):
-            link = r.get("href") or r.get("url") or ""
-            if "apps.apple.com" in link:
-                kind, apple_id = extract_apple_ids(link)
-                if apple_id:
-                    return link, kind, apple_id
-        time.sleep(WEB_SLEEP)
-    return None, None, None
-
-
-# ---------- steps 2-4: iTunes API ----------
-
-def lookup_app(app_id):
-    """Look up a single app by id; return (software_item, url)."""
-    url = f"https://itunes.apple.com/lookup?id={app_id}&country=us"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    for item in results:
-        if item.get("wrapperType") == "software" or item.get("kind") == "software":
-            return item, url
-    return (results[0] if results else None), url
+def itunes_search(term):
+    return itunes_get("https://itunes.apple.com/search",
+                      {"term": term, "entity": "software", "country": "us",
+                       "limit": SEARCH_LIMIT})
 
 
 def get_all_apps_by_developer(artist_id):
-    """Use developer (artist) id to get every app under that developer."""
-    url = f"https://itunes.apple.com/lookup?id={artist_id}&entity=software&country=us"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    results = resp.json().get("results", [])
-    apps = [x for x in results if x.get("wrapperType") == "software"]
-    return apps, url
+    results = itunes_get("https://itunes.apple.com/lookup",
+                         {"id": artist_id, "entity": "software", "country": "us"})
+    return [x for x in results if x.get("wrapperType") == "software"]
 
 
-# ---------- confidence + row builder ----------
+# ---------- candidate selection + confidence ----------
 
-def assess_confidence(company_domain, company_name, apps, dev_name):
-    for a in apps:
-        if company_domain and registered_domain(a.get("sellerUrl", "")) == company_domain:
-            return "HIGH", f"domain_match={company_domain}"
-    sim = name_similarity(company_name, dev_name)
+def pick_best_candidate(candidates, domain, name):
+    if domain:
+        for c in candidates:
+            if registered_domain(c.get("sellerUrl", "")) == domain:
+                return c, f"domain_match={domain}"
+    best, best_sim = None, 0.0
+    for c in candidates:
+        sim = max(name_similarity(name, c.get("trackName", "")),
+                  name_similarity(name, c.get("sellerName", "")),
+                  name_similarity(name, c.get("artistName", "")))
+        if sim > best_sim:
+            best, best_sim = c, sim
+    if best and best_sim >= 0.6:
+        return best, f"name_sim={best_sim:.2f}"
+    return candidates[0], "top_result_unconfirmed"
+
+
+def assess_confidence(domain, name, apps, dev_name, how):
+    if how.startswith("domain_match"):
+        return "HIGH", how
+    sim = name_similarity(name, dev_name)
     if sim >= 0.85:
-        return "MEDIUM", f"dev_name_sim={sim:.2f}"
+        return "MEDIUM", f"{how}; dev_name_sim={sim:.2f}"
     if sim >= 0.6:
-        return "LOW", f"dev_name_sim={sim:.2f}"
-    return "LOW", "found via web search; no domain/name confirmation"
+        return "LOW", f"{how}; dev_name_sim={sim:.2f}"
+    return "LOW", how
 
 
 def make_row(company, status, apple_link="", dev_id="", dev_name="", dev_url="",
-             lookup_url="", app=None, confidence="", note=""):
+             app=None, confidence="", note=""):
     app = app or {}
     return {
         "CompanyID": company["id"],
@@ -169,7 +141,6 @@ def make_row(company, status, apple_link="", dev_id="", dev_name="", dev_url="",
         "Matched_Developer_Name": dev_name,
         "Matched_Developer_ID": dev_id,
         "Matched_Developer_URL": dev_url,
-        "Developer_Lookup_URL": lookup_url,
         "Developer_App_Name": app.get("trackName", ""),
         "Developer_App_ID": app.get("trackId", ""),
         "Developer_Bundle_ID": app.get("bundleId", ""),
@@ -181,94 +152,80 @@ def make_row(company, status, apple_link="", dev_id="", dev_name="", dev_url="",
     }
 
 
-def process_company(company, company_domain, ddgs):
-    """Return the list of output rows for one company."""
+def process_company(company):
+    domain = registered_domain(company["website"])
     try:
-        url, kind, apple_id = find_apple_listing(company["name"], company_domain, ddgs)
-        if not apple_id:
-            return [make_row(company, "NO_APPLE_LINK_FOUND")]
+        candidates = itunes_search(company["name"])
+        if not candidates:
+            return [make_row(company, "NO_APP_FOUND")]
 
-        # Get the developer (artist) id.
-        if kind == "developer":
-            artist_id = apple_id
-        else:  # an app page -> look it up to find its developer
-            app_item, _ = lookup_app(apple_id)
-            time.sleep(API_SLEEP)
-            if not app_item or not app_item.get("artistId"):
-                return [make_row(company, "APP_FOUND_NO_DEVELOPER", apple_link=url)]
-            artist_id = app_item.get("artistId")
+        best, how = pick_best_candidate(candidates, domain, company["name"])
+        artist_id = best.get("artistId")
+        if not artist_id:
+            return [make_row(company, "APP_FOUND_NO_DEVELOPER",
+                             apple_link=best.get("trackViewUrl", ""))]
 
-        # Enumerate every app under that developer.
-        apps, lookup_url = get_all_apps_by_developer(artist_id)
-        time.sleep(API_SLEEP)
-
-        if not apps:
-            return [make_row(company, "DEVELOPER_NO_APPS",
-                             apple_link=url, dev_id=artist_id, lookup_url=lookup_url)]
-
+        apps = get_all_apps_by_developer(artist_id) or [best]
         dev_name = apps[0].get("sellerName") or apps[0].get("artistName") or ""
         dev_url = apps[0].get("artistViewUrl") or ""
-        confidence, note = assess_confidence(company_domain, company["name"], apps, dev_name)
+        confidence, note = assess_confidence(domain, company["name"], apps, dev_name, how)
 
         return [
-            make_row(company, "MATCHED", apple_link=url, dev_id=artist_id,
-                     dev_name=dev_name, dev_url=dev_url, lookup_url=lookup_url,
+            make_row(company, "MATCHED",
+                     apple_link=best.get("trackViewUrl", ""), dev_id=artist_id,
+                     dev_name=dev_name, dev_url=dev_url,
                      app=a, confidence=confidence, note=note)
             for a in apps
         ]
-
     except Exception as e:
         return [make_row(company, "ERROR", note=str(e))]
 
 
-if __name__ == "__main__":
+def run():
     df = pd.read_excel(INPUT_FILE)
     if "AI_Result" not in df.columns:
         raise SystemExit("No AI_Result column — run AppClassifer.py (step 2) first.")
 
-    all_rows = []
-    done_ids = set()
-    if os.path.exists(OUTPUT_FILE):  # resume from a previous run
+    all_rows, done_ids = [], set()
+    if os.path.exists(OUTPUT_FILE):
         prev = pd.read_excel(OUTPUT_FILE)
         all_rows = prev.to_dict("records")
         done_ids = set(prev["CompanyID"].dropna().tolist())
-        print(f"Resuming — {len(done_ids)} companies already processed.")
+        print(f"[apple] resuming — {len(done_ids)} companies already processed")
 
-    total = len(df)
-    processed = 0
-    ddgs = DDGS()
-
-    for index, row in df.iterrows():
-        status = str(row.get("AI_Result", "")).strip().upper()
+    pending = []
+    for _, row in df.iterrows():
         company = {
             "id": row.get("CompanyID"),
             "name": row.get("CompanyName"),
             "website": row.get("Website"),
             "industry": row.get("PrimaryIndustryGroup"),
         }
-
         if company["id"] in done_ids:
             continue
-
+        status = str(row.get("AI_Result", "")).strip().upper()
         if status not in PROCESS_STATUSES:
             all_rows.append(make_row(company, f"SKIPPED_AI_{status or 'BLANK'}"))
             done_ids.add(company["id"])
             continue
+        pending.append(company)
 
-        company_domain = registered_domain(company["website"])
-        print(f"{index + 1}/{total}: {company['name']} (AI={status})")
+    print(f"[apple] {len(pending)} companies to look up, {MAX_WORKERS} parallel")
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(process_company, c): c for c in pending}
+        for fut in as_completed(futures):
+            all_rows.extend(fut.result())
+            done += 1
+            if done % CHECKPOINT_EVERY == 0:
+                pd.DataFrame(all_rows).to_excel(OUTPUT_FILE, index=False)
+                print(f"[apple]   {done}/{len(pending)} done (checkpoint saved)")
 
-        all_rows.extend(process_company(company, company_domain, ddgs))
-        done_ids.add(company["id"])
-        processed += 1
+    out = pd.DataFrame(all_rows)
+    out.to_excel(OUTPUT_FILE, index=False)
+    print(f"[apple] done -> {OUTPUT_FILE}")
+    print(out["Match_Status"].value_counts())
 
-        if processed % CHECKPOINT_EVERY == 0:
-            pd.DataFrame(all_rows).to_excel(OUTPUT_FILE, index=False)
-            print(f"  ...checkpoint saved ({processed} searched this run)")
 
-        time.sleep(WEB_SLEEP)
-
-    pd.DataFrame(all_rows).to_excel(OUTPUT_FILE, index=False)
-    print("Done.")
-    print(f"Saved to: {OUTPUT_FILE}")
-    print(pd.DataFrame(all_rows)["Match_Status"].value_counts())
+if __name__ == "__main__":
+    run()

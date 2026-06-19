@@ -14,8 +14,8 @@ INPUT_FILE = "/Users/tianyuzhou/Documents/Finance_RA/pitchbook_app_pilot.xlsx"
 OUTPUT_FILE = "/Users/tianyuzhou/Documents/Finance_RA/pitchbook_app_classified.xlsx"
 
 CHECKPOINT_EVERY = 25
-SLEEP_SECONDS = 1.0
-MODEL = "gemini-2.5-flash"
+SLEEP_SECONDS = 4.0
+MODEL = "gemini-2.5-flash-lite"
 
 load_dotenv("AI_apis.env")  # your env file is named AI_apis.env, not .env
 client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])

@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "google-play-scraper": "^10.1.3"
+  }
+}

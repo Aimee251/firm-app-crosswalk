@@ -39,7 +39,7 @@ NAME_NOISE = {
 }
 
 
-# ---------- name / domain helpers ----------
+# name / domain helpers
 
 def core_name(name):
     if not isinstance(name, str):
@@ -74,7 +74,7 @@ def name_similarity(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
-# ---------- iTunes API (with backoff on 403/429) ----------
+# iTunes API (with backoff on 403/429)
 
 def itunes_get(url, params):
     for attempt in range(MAX_RETRIES):
@@ -99,7 +99,7 @@ def get_all_apps_by_developer(artist_id):
     return [x for x in results if x.get("wrapperType") == "software"]
 
 
-# ---------- candidate selection + confidence ----------
+# candidate selection + confidence
 
 def pick_best_candidate(candidates, domain, name):
     if domain:
